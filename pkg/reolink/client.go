@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/AlexxIT/go2rtc/pkg/baichuan"
@@ -47,19 +48,22 @@ type Client struct {
 	videoTimestamps timestampUnwrapper
 	videoRTP        rtpTimestampGuard
 
-	audioSamples uint64
-	audioRTP     rtpTimestampGuard
-	adpcmDecoder *baichuan.ADPCMDecoder
-
-	baseTicks      uint64
-	baseTime       time.Time
-	baseSet        bool
-	lastVideoUS    uint64
+	audioTimestamps     timestampUnwrapper
+	audioTimestampGuard rtpTimestampGuard
+	nextAudioTS         uint32
+	adpcmDecoder        *baichuan.ADPCMDecoder
 
 	talkMu    sync.Mutex
 	talkTimer *time.Timer
 
-	lastWriteTime time.Time
+	// pacing: smooths bursty camera delivery onto the wire so steady,
+	// self-clocked audio does not race ahead of the lagging video.
+	videoPace   videoPaceState
+	videoPacer  *mediaPacer
+	audioPacer  *mediaPacer
+	pacerCancel context.CancelFunc
+	pacerWg     sync.WaitGroup
+	started     atomic.Bool
 }
 
 func Dial(rawURL string) (*Client, error) {
@@ -69,7 +73,6 @@ func Dial(rawURL string) (*Client, error) {
 	}
 
 	c := &Client{url: u}
-	c.videoRTP.smooth = false
 	c.videoEnabled = true
 	c.audioEnabled = true
 
@@ -141,6 +144,10 @@ func Dial(rawURL string) (*Client, error) {
 }
 
 func (c *Client) Close() error {
+	if c.pacerCancel != nil {
+		c.pacerCancel()
+	}
+	c.pacerWg.Wait()
 	if c.cancel != nil {
 		c.cancel()
 	}

@@ -192,6 +192,39 @@ func (c *Client) Start() error {
 		c.reader = reader
 	}
 
+	// Set up the wall-clock pacers.
+	if !c.started.Swap(true) {
+		pacerCtx, pacerCancel := context.WithCancel(context.Background())
+		c.pacerCancel = pacerCancel
+
+		c.videoPace.reset()
+		c.videoPacer = &mediaPacer{
+			ch:             make(chan pacedFrame, 400),
+			maxLead:        3000 * time.Millisecond,
+			initialLatency: 1500 * time.Millisecond,
+			snapOnPast:     false,
+			logf:           c.logWarn,
+		}
+		c.pacerWg.Add(1)
+		go func() {
+			defer c.pacerWg.Done()
+			c.videoPacer.run(pacerCtx)
+		}()
+
+		c.audioPacer = &mediaPacer{
+			ch:             make(chan pacedFrame, 200),
+			maxLead:        2000 * time.Millisecond,
+			initialLatency: 1500 * time.Millisecond,
+			snapOnPast:     true,
+			logf:           c.logWarn,
+		}
+		c.pacerWg.Add(1)
+		go func() {
+			defer c.pacerWg.Done()
+			c.audioPacer.run(pacerCtx)
+		}()
+	}
+
 	var videoCount, audioCount int
 
 	// replay the I-Frame that was consumed during Probe
@@ -224,7 +257,6 @@ func (c *Client) processPacket(packet baichuan.MediaPacket, videoCount, audioCou
 			return
 		}
 
-
 		if packet.Codec == "H265" {
 			// NALU reordering...
 			nalus := splitAnnexB(packet.Data)
@@ -247,37 +279,8 @@ func (c *Client) processPacket(packet baichuan.MediaPacket, videoCount, audioCou
 
 		continuousUS := c.videoTimestamps.unwrap(packet.TimestampMicrosecs)
 
-		if !c.baseSet {
-			c.baseTicks = continuousUS
-			c.baseTime = time.Now()
-			c.baseSet = true
-		} else if c.baseTicks == 0 {
-			// Audio started first. Initialize baseTicks based on elapsed time.
-			elapsedUS := uint64(time.Since(c.baseTime).Microseconds())
-			if continuousUS > elapsedUS {
-				c.baseTicks = continuousUS - elapsedUS
-			} else {
-				c.baseTicks = 0
-			}
-		}
-
-		if continuousUS < c.baseTicks {
-			// Clock jumped backward or reset below baseTicks. Realize new base to prevent uint64 underflow.
-			c.baseTicks = continuousUS
-		}
-
-		relativeUS := continuousUS - c.baseTicks
-
-		if relativeUS < c.lastVideoUS {
-			// Clock jumped backward. Realign baseTime to match the new timeline and preserve pacing.
-			c.baseTime = time.Now().Add(-time.Duration(relativeUS) * time.Microsecond)
-		}
-
-		rawVideoRTP := uint32(relativeUS * 90000 / 1_000_000)
-		timestamp := c.videoRTP.next(rawVideoRTP)
-		c.lastVideoUS = relativeUS
-
-		c.lastWriteTime = time.Now()
+		clockRate := 90000
+		timestamp := rtpTimestampForClock(continuousUS, clockRate)
 
 		pkt := &core.Packet{
 			Header: rtp.Header{
@@ -287,18 +290,28 @@ func (c *Client) processPacket(packet baichuan.MediaPacket, videoCount, audioCou
 			Payload: packet.Data,
 		}
 
-		for _, receiver := range c.receivers {
-			if receiver.Codec.Name == core.CodecH264 || receiver.Codec.Name == core.CodecH265 {
-				if receiver.Codec.Name == core.CodecH264 && packet.Codec != "H264" {
-					continue
-				}
-				if receiver.Codec.Name == core.CodecH265 && packet.Codec != "H265" {
-					continue
-				}
+		videoCodec := packet.Codec
+		write := func(p *core.Packet) {
+			for _, receiver := range c.receivers {
+				if receiver.Codec.Name == core.CodecH264 || receiver.Codec.Name == core.CodecH265 {
+					if receiver.Codec.Name == core.CodecH264 && videoCodec != "H264" {
+						continue
+					}
+					if receiver.Codec.Name == core.CodecH265 && videoCodec != "H265" {
+						continue
+					}
 
-				clone := *pkt
-				receiver.WriteRTP(&clone)
+					clone := *p
+					receiver.WriteRTP(&clone)
+				}
 			}
+		}
+
+		dur := c.videoPace.durationForFrame(continuousUS)
+		if c.videoPacer != nil {
+			c.videoPacer.enqueue(pacedFrame{pkts: []*core.Packet{pkt}, write: write, duration: dur})
+		} else {
+			write(pkt)
 		}
 		*videoCount++
 
@@ -310,27 +323,54 @@ func (c *Client) processPacket(packet baichuan.MediaPacket, videoCount, audioCou
 		if !c.audioEnabled {
 			return
 		}
+
+		const samplesPerAccessUnit = 1024
+		var aacSampleRates = []uint32{
+			96000,
+			88200,
+			64000,
+			48000,
+			44100,
+			32000,
+			24000,
+			22050,
+			16000,
+			12000,
+			11025,
+			8000,
+			7350,
+		}
+
+		var sampleRate uint32 = 16000
+
 		var pkts []*core.Packet
 		payload := packet.Data
 		for len(payload) > 0 {
+			// Parse ADTS access units
 			if !aac.IsADTS(payload) {
 				break // reached padding or invalid data
 			}
 
 			headerLen := aac.ADTSHeaderLen(payload)
 			// Frame length is 13 bits starting at byte 3, bit 13.
-			frameLen := (int(payload[3]&3) << 11) | (int(payload[4]) << 3) | (int(payload[5]) >> 5)
+			frameLen := (int(payload[3]&3) << 11) | (int(payload[4]) << 3) | ((int(payload[5]) >> 5) & 7)
 
 			if frameLen < headerLen || frameLen > len(payload) {
 				break // invalid frame length
+			}
+
+			sampleRateIndex := (payload[2] >> 2) & 0x0F
+			if sampleRateIndex <= 12 {
+				sampleRate = aacSampleRates[sampleRateIndex]
 			}
 
 			rawAAC := payload[headerLen:frameLen]
 
 			pkt := &core.Packet{
 				Header: rtp.Header{
-					Version: aac.RTPPacketVersionAAC,
-					Marker:  true,
+					Version:   aac.RTPPacketVersionAAC,
+					Marker:    true,
+					Timestamp: uint32(len(pkts) * samplesPerAccessUnit),
 				},
 				Payload: rawAAC,
 			}
@@ -342,77 +382,55 @@ func (c *Client) processPacket(packet baichuan.MediaPacket, videoCount, audioCou
 			return
 		}
 
-		var clockRate uint32 = 16000
-		for _, receiver := range c.receivers {
-			if receiver.Codec.Name == core.CodecAAC {
-				clockRate = receiver.Codec.ClockRate
-				break
-			}
+		hasExpectedTS := packet.HasTimestamp
+		expectedTS := uint32(0)
+		if hasExpectedTS {
+			timestampMicroseconds := c.audioTimestamps.unwrap(packet.TimestampMicrosecs)
+			expectedTS = rtpTimestampForClock(timestampMicroseconds, int(sampleRate))
 		}
 
+		// Initialize audio
 		if *audioCount == 0 {
-			if !c.baseSet {
-				c.baseTime = time.Now()
-				c.baseSet = true
-				c.audioSamples = 0
-			} else if c.baseTicks != 0 && time.Since(c.lastWriteTime) < 500*time.Millisecond {
-				c.audioSamples = c.guardedVideoUS() * uint64(clockRate) / 1_000_000
-			} else {
-				elapsed := time.Since(c.baseTime)
-				c.audioSamples = uint64(elapsed.Microseconds()) * uint64(clockRate) / 1_000_000
+			c.nextAudioTS = 0
+			if hasExpectedTS {
+				c.nextAudioTS = expectedTS
 			}
 		}
 
+		samples := len(pkts) * samplesPerAccessUnit
 
-
-		var outPkts []*core.Packet
+		baseTimestamp := c.nextAudioTS
+		if hasExpectedTS {
+			baseTimestamp = expectedTS
+		}
+		baseTimestamp = c.audioTimestampGuard.applyBaseToPackets(pkts, baseTimestamp, uint32(samples))
 		for _, pkt := range pkts {
-			if c.baseSet {
-				var targetUS uint64
-				if c.baseTicks != 0 && c.lastVideoUS != 0 && time.Since(c.lastWriteTime) < 500*time.Millisecond {
-					targetUS = c.guardedVideoUS()
-				} else {
-					targetUS = uint64(time.Since(c.baseTime).Microseconds())
-				}
-
-				expectedAudioUS := c.audioSamples * 1_000_000 / uint64(clockRate)
-				driftUS := int64(expectedAudioUS) - int64(targetUS)
-				driftSamples := driftUS * int64(clockRate) / 1_000_000
-
-				if driftSamples >= 1024 {
-					continue // Drop packet
-				} else if driftSamples <= -1024 {
-					clone1 := *pkt
-					clone1.Timestamp = c.audioRTP.next(uint32(c.audioSamples))
-					c.audioSamples += 1024
-					outPkts = append(outPkts, &clone1)
-
-					clone2 := *pkt
-					clone2.Timestamp = c.audioRTP.next(uint32(c.audioSamples))
-					c.audioSamples += 1024
-					outPkts = append(outPkts, &clone2)
-					continue
-				}
-			}
-
-			pkt.Timestamp = c.audioRTP.next(uint32(c.audioSamples))
-			c.audioSamples += 1024
-			outPkts = append(outPkts, pkt)
+			pkt.Timestamp += baseTimestamp
 		}
+		c.nextAudioTS = baseTimestamp + uint32(samples)
 
-		for _, receiver := range c.receivers {
-			if receiver.Codec.Name == core.CodecAAC {
-				for _, pkt := range outPkts {
-					clone := *pkt
+		aacWrite := func(p *core.Packet) {
+			for _, receiver := range c.receivers {
+				if receiver.Codec.Name == core.CodecAAC {
+					clone := *p
 					receiver.WriteRTP(&clone)
 				}
 			}
 		}
 
-		*audioCount += len(outPkts)
-		if *audioCount <= 3 && len(outPkts) > 0 {
+		if c.audioPacer != nil {
+			paceDur := time.Microsecond * time.Duration(int64(samples)*1_000_000/int64(sampleRate))
+			c.audioPacer.enqueue(pacedFrame{pkts: pkts, write: aacWrite, duration: paceDur})
+		} else {
+			for _, pkt := range pkts {
+				aacWrite(pkt)
+			}
+		}
+
+		*audioCount += len(pkts)
+		if *audioCount <= 3 && len(pkts) > 0 {
 			c.logDebug("audio pkt #%d len=%d ts=%d",
-				*audioCount, len(outPkts[0].Payload), outPkts[0].Timestamp)
+				*audioCount, len(pkts[0].Payload), pkts[0].Timestamp)
 		}
 	case baichuan.MediaPacketADPCM:
 		if !c.audioEnabled {
@@ -429,31 +447,29 @@ func (c *Client) processPacket(packet baichuan.MediaPacket, videoCount, audioCou
 			return
 		}
 
-		var clockRate uint32 = 8000
-		for _, receiver := range c.receivers {
-			if receiver.Codec.Name == core.CodecPCMA {
-				clockRate = receiver.Codec.ClockRate
-				break
-			}
+		const sampleRate uint32 = 8000 // Reolink usually sends ADPCM at 8kHz
+		const sampleSize = 1           // 8 bit mono - one byte
+
+		hasExpectedTS := packet.HasTimestamp
+		expectedTS := uint32(0)
+		if hasExpectedTS {
+			timestampMicroseconds := c.audioTimestamps.unwrap(packet.TimestampMicrosecs)
+			expectedTS = rtpTimestampForClock(timestampMicroseconds, int(sampleRate))
 		}
 
+		// Initialize audio
 		if *audioCount == 0 {
-			if !c.baseSet {
-				c.baseTime = time.Now()
-				c.baseSet = true
-				c.audioSamples = 0
-			} else if c.baseTicks != 0 && time.Since(c.lastWriteTime) < 500*time.Millisecond {
-				c.audioSamples = c.guardedVideoUS() * uint64(clockRate) / 1_000_000
-			} else {
-				elapsed := time.Since(c.baseTime)
-				c.audioSamples = uint64(elapsed.Microseconds()) * uint64(clockRate) / 1_000_000
+			c.nextAudioTS = 0
+			if hasExpectedTS {
+				c.nextAudioTS = expectedTS
 			}
 		}
 
 		var pkts []*core.Packet
 		payload := pcma
+		timestamp := uint32(0)
 		for len(payload) > 0 {
-			chunkSize := 160
+			chunkSize := 1460 // 1500 (UDP MTU) - 20 (IP header) - 8 (UDP header) - 12 (RTP header)
 			if len(payload) < chunkSize {
 				chunkSize = len(payload)
 			}
@@ -462,75 +478,54 @@ func (c *Client) processPacket(packet baichuan.MediaPacket, videoCount, audioCou
 
 			pkt := &core.Packet{
 				Header: rtp.Header{
-					Marker: true,
+					Marker:    true,
+					Timestamp: timestamp,
 				},
 				Payload: chunk,
 			}
 			pkts = append(pkts, pkt)
+			timestamp += uint32(chunkSize / sampleSize)
 		}
 
+		if len(pkts) == 0 {
+			return
+		}
 
-
-		var outPkts []*core.Packet
+		duration := uint32(len(pcm)) //#nosec G115
+		baseTimestamp := c.nextAudioTS
+		if hasExpectedTS {
+			baseTimestamp = expectedTS
+		}
+		baseTimestamp = c.audioTimestampGuard.applyBaseToPackets(pkts, baseTimestamp, duration)
 		for _, pkt := range pkts {
-			chunkSize := int64(len(pkt.Payload))
-			if c.baseSet {
-				var targetUS uint64
-				if c.baseTicks != 0 && c.lastVideoUS != 0 && time.Since(c.lastWriteTime) < 500*time.Millisecond {
-					targetUS = c.guardedVideoUS()
-				} else {
-					targetUS = uint64(time.Since(c.baseTime).Microseconds())
-				}
-
-				expectedAudioUS := c.audioSamples * 1_000_000 / uint64(clockRate)
-				driftUS := int64(expectedAudioUS) - int64(targetUS)
-				driftSamples := driftUS * int64(clockRate) / 1_000_000
-
-				if driftSamples >= chunkSize {
-					continue // Drop packet
-				} else if driftSamples <= -chunkSize {
-					clone1 := *pkt
-					clone1.Timestamp = c.audioRTP.next(uint32(c.audioSamples))
-					c.audioSamples += uint64(chunkSize)
-					outPkts = append(outPkts, &clone1)
-
-					clone2 := *pkt
-					clone2.Timestamp = c.audioRTP.next(uint32(c.audioSamples))
-					c.audioSamples += uint64(chunkSize)
-					outPkts = append(outPkts, &clone2)
-					continue
-				}
-			}
-
-			pkt.Timestamp = c.audioRTP.next(uint32(c.audioSamples))
-			c.audioSamples += uint64(chunkSize)
-			outPkts = append(outPkts, pkt)
+			pkt.Timestamp += baseTimestamp
 		}
+		c.nextAudioTS = baseTimestamp + duration
 
-		for _, receiver := range c.receivers {
-			if receiver.Codec.Name == core.CodecPCMA {
-				for _, pkt := range outPkts {
-					clone := *pkt
+		pcmaWrite := func(p *core.Packet) {
+			for _, receiver := range c.receivers {
+				if receiver.Codec.Name == core.CodecPCMA {
+					clone := *p
 					receiver.WriteRTP(&clone)
 				}
 			}
 		}
 
-		*audioCount += len(outPkts)
-		if *audioCount <= 3 && len(outPkts) > 0 {
+		if c.audioPacer != nil {
+			paceDur := time.Microsecond * time.Duration(int64(len(pcm))*1_000_000/int64(sampleRate))
+			c.audioPacer.enqueue(pacedFrame{pkts: pkts, write: pcmaWrite, duration: paceDur})
+		} else {
+			for _, pkt := range pkts {
+				pcmaWrite(pkt)
+			}
+		}
+
+		*audioCount += len(pkts)
+		if *audioCount <= 3 && len(pkts) > 0 {
 			c.logDebug("audio pkt #%d len=%d ts=%d",
-				*audioCount, len(outPkts[0].Payload), outPkts[0].Timestamp)
+				*audioCount, len(pkts[0].Payload), pkts[0].Timestamp)
 		}
 	}
-}
-
-func (c *Client) guardedVideoUS() uint64 {
-	offsetUS := int64(int32(c.videoRTP.offset)) * 1_000_000 / 90000
-	guarded := int64(c.lastVideoUS) + offsetUS
-	if guarded < 0 {
-		return 0
-	}
-	return uint64(guarded)
 }
 
 func (c *Client) Stop() error {
@@ -561,24 +556,35 @@ func (c *Client) MarshalJSON() ([]byte, error) {
 
 type timestampUnwrapper struct {
 	highest uint64
+	offset  uint64
 	baseSet bool
+	// nowUnixMicro is optional; when nil, time.Now().UnixMicro is used (first sample anchors to wall clock).
+	nowUnixMicro func() int64
 }
 
 func (u *timestampUnwrapper) unwrap(ts32 uint32) uint64 {
 	if !u.baseSet {
+		nowFn := func() int64 { return time.Now().UnixMicro() }
+		if u.nowUnixMicro != nil {
+			nowFn = u.nowUnixMicro
+		}
+		micros := nowFn()
+		if micros < 0 {
+			micros = 0
+		}
+		systemMicro := uint64(micros)
+		u.offset = systemMicro - uint64(ts32)
 		u.highest = uint64(ts32)
 		u.baseSet = true
-		return uint64(ts32)
+		return systemMicro
 	}
 
 	continuous := unwrapTimestamp(ts32, u.highest)
 	if continuous > u.highest {
 		u.highest = continuous
 	}
-	return continuous
+	return continuous + u.offset
 }
-
-
 
 func unwrapTimestamp(ts32 uint32, highest64 uint64) uint64 {
 	if highest64 == 0 {
@@ -617,78 +623,75 @@ func unwrapTimestamp(ts32 uint32, highest64 uint64) uint64 {
 }
 
 type rtpTimestampGuard struct {
-	offset   uint32
-	last     uint32
-	set      bool
-	smooth   bool
-	avgDelta float64
-	lastRaw  uint32
+	offset uint32
+	last   uint32
+	set    bool
 }
 
 func (g *rtpTimestampGuard) next(ts uint32) uint32 {
 	if !g.set {
 		g.last = ts
-		g.lastRaw = ts
-		g.avgDelta = 6000 // default for 15 FPS
 		g.set = true
 		return ts
 	}
-
-	if !g.smooth {
-		adjusted := ts + g.offset
-		if ts == g.last {
-			g.offset = g.last + 1 - ts
-			adjusted = g.last + 1
-		} else if int32(adjusted-g.last) <= 0 {
-			jumpBackward := uint32(int32(g.last - adjusted))
-			if jumpBackward > 90000 {
-				g.offset = g.last + 1 - ts
-				adjusted = ts + g.offset
-			} else {
-				adjusted = g.last + 1
-			}
-		}
-		g.last = adjusted
-		return adjusted
-	}
-
-	rawDelta := int32(ts - g.lastRaw)
-	if rawDelta < 100 || rawDelta > 45000 {
-		// Jump or discontinuity (wrap, drop, restart)
-		g.lastRaw = ts
-		g.avgDelta = 6000
-
-		adjusted := ts + g.offset
-		if int32(adjusted-g.last) <= 0 {
-			adjusted = g.last + 1
-		}
-		g.offset = adjusted - ts
-		g.last = adjusted
-		return adjusted
-	}
-
-	// Exponential moving average for average delta
-	g.avgDelta = (g.avgDelta*15 + float64(rawDelta)) / 16
-	g.lastRaw = ts
-
-	// PLL feedback correction
-	step := g.avgDelta
-	expected := ts + g.offset
-	drift := int32(g.last + uint32(step+0.5) - expected)
-
-	if drift > 9000 { // >100ms ahead of camera -> slow down step
-		step -= 200
-	} else if drift < -9000 { // >100ms behind camera -> speed up step
-		step += 200
-	}
-
-	adjusted := g.last + uint32(step+0.5)
-
-	if int32(adjusted-g.last) <= 0 {
+	adjusted := ts + g.offset
+	if ts == g.last {
+		g.offset = g.last + 1 - ts
 		adjusted = g.last + 1
+	} else if !rtpTimestampAfter(adjusted, g.last) {
+		jumpBackward := uint32(int32(g.last - adjusted))
+		if jumpBackward > 90000 {
+			g.offset = g.last + 1 - ts
+			adjusted = ts + g.offset
+		} else {
+			adjusted = g.last + 1
+		}
 	}
-
-	g.offset = adjusted - ts
 	g.last = adjusted
 	return adjusted
+}
+
+func (g *rtpTimestampGuard) applyBaseToPackets(pkts []*rtp.Packet, base uint32, duration uint32) uint32 {
+	if len(pkts) == 0 {
+		return base
+	}
+
+	sum := base + pkts[0].Timestamp //#nosec G115
+	first := sum + g.offset
+	if g.set && sum == g.last {
+		g.offset = 0
+		first = sum
+	}
+	if g.set && rtpTimestampBefore(first, g.last) {
+		jumpBackward := uint32(int32(g.last - first))
+		if jumpBackward > 90000 {
+			g.offset = g.last - sum
+			first = sum + g.offset
+		} else {
+			first = g.last
+		}
+	}
+
+	adjusted := first
+	if duration == 0 {
+		g.last = adjusted
+	} else {
+		g.last = adjusted + duration
+	}
+	g.set = true
+	return adjusted - pkts[0].Timestamp
+}
+
+func rtpTimestampAfter(ts uint32, prev uint32) bool {
+	return int32(ts-prev) > 0 //#nosec G115
+}
+
+func rtpTimestampBefore(ts uint32, prev uint32) bool {
+	return int32(ts-prev) < 0 //#nosec G115
+}
+
+func rtpTimestampForClock(microseconds uint64, clockRate int) uint32 {
+	seconds := microseconds / 1_000_000
+	rem := microseconds % 1_000_000
+	return uint32(seconds*uint64(clockRate) + (rem*uint64(clockRate))/1_000_000) //#nosec G115
 }
